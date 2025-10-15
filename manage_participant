@@ -1,0 +1,603 @@
+<?php
+session_start();
+require_once 'config.php';
+
+// Admin access only
+if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'admin') {
+    header("Location: dashboard.php");
+    exit();
+}
+
+// Handle account activation toggle
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_status'])) {
+    $userId = (int)$_POST['user_id'];
+    $currentStatus = (int)$_POST['current_status'];
+    $newStatus = $currentStatus ? 0 : 1;
+    
+    $stmt = $conn->prepare("UPDATE users SET is_verified = ? WHERE id = ? AND role = 'user'");
+    $stmt->bind_param("ii", $newStatus, $userId);
+    
+    if ($stmt->execute()) {
+        $_SESSION['success'] = $newStatus ? "Akaun diaktifkan" : "Akaun dinyahaktifkan";
+    }
+    $stmt->close();
+    header("Location: manage_participants.php");
+    exit();
+}
+
+// Handle soft delete
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_user'])) {
+    $userId = (int)$_POST['user_id'];
+    
+    // Soft delete by setting deleted_at timestamp
+    $stmt = $conn->prepare("UPDATE users SET deleted_at = NOW() WHERE id = ? AND role = 'user'");
+    $stmt->bind_param("i", $userId);
+    
+    if ($stmt->execute()) {
+        $_SESSION['success'] = "Pengguna berjaya dipadam";
+    }
+    $stmt->close();
+    header("Location: manage_participants.php");
+    exit();
+}
+
+// Get search and filter parameters
+$search = isset($_GET['search']) ? trim($_GET['search']) : '';
+$status_filter = isset($_GET['status']) ? $_GET['status'] : 'all';
+$page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
+$per_page = 20;
+$offset = ($page - 1) * $per_page;
+
+// Build query
+$where_clauses = ["u.role = 'user'", "u.deleted_at IS NULL"];
+$params = [];
+$types = '';
+
+if (!empty($search)) {
+    $where_clauses[] = "(m.nama LIKE ? OR u.email LIKE ? OR u.no_kp LIKE ?)";
+    $search_param = "%$search%";
+    $params[] = $search_param;
+    $params[] = $search_param;
+    $params[] = $search_param;
+    $types .= 'sss';
+}
+
+if ($status_filter === 'verified') {
+    $where_clauses[] = "u.is_verified = 1";
+} elseif ($status_filter === 'unverified') {
+    $where_clauses[] = "u.is_verified = 0";
+}
+
+$where_sql = implode(' AND ', $where_clauses);
+
+// Count total users
+$count_sql = "SELECT COUNT(*) as total FROM users u WHERE $where_sql";
+$count_stmt = $conn->prepare($count_sql);
+if (!empty($params)) {
+    $count_stmt->bind_param($types, ...$params);
+}
+$count_stmt->execute();
+$total_users = $count_stmt->get_result()->fetch_assoc()['total'];
+$total_pages = ceil($total_users / $per_page);
+
+// Get users with pagination
+$sql = "SELECT u.id, u.email, u.no_kp, u.is_verified, u.created_at,
+        m.nama, m.tel_rumah, m.jantina,
+        COUNT(dk.daftar_id) as total_courses
+        FROM users u
+        LEFT JOIN maklumat_diri m ON u.id = m.user_id
+        LEFT JOIN daftar_kursus dk ON u.id = dk.user_id
+        WHERE $where_sql
+        GROUP BY u.id
+        ORDER BY u.created_at DESC
+        LIMIT ? OFFSET ?";
+
+$stmt = $conn->prepare($sql);
+$params[] = $per_page;
+$params[] = $offset;
+$types .= 'ii';
+$stmt->bind_param($types, ...$params);
+$stmt->execute();
+$result = $stmt->get_result();
+$users = [];
+while ($row = $result->fetch_assoc()) {
+    $users[] = $row;
+}
+
+$pageTitle = "Pengurusan Peserta";
+?>
+
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+    <meta charset="UTF-8">
+    <title><?= htmlspecialchars($pageTitle) ?> | e-Kursus ALPHA APM</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #0C3C60;
+            --primary-dark: #082841;
+            --primary-light: #1a5a8f;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #e4e9f2 100%);
+            min-height: 100vh;
+        }
+        
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            width: 280px;
+            background: linear-gradient(180deg, var(--primary-color) 0%, var(--primary-dark) 100%);
+            padding: 0;
+            transition: all 0.3s;
+            z-index: 1000;
+            box-shadow: 4px 0 24px rgba(0,0,0,0.12);
+            overflow-y: auto;
+        }
+        
+        .sidebar .logo-section {
+            padding: 32px 24px;
+            text-align: center;
+            background: rgba(0,0,0,0.15);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .sidebar .logo-icon {
+            width: 64px;
+            height: 64px;
+            background: linear-gradient(135deg, #2196F3, #06b6d4);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px;
+            box-shadow: 0 8px 16px rgba(0,0,0,0.2);
+        }
+        
+        .sidebar .logo-icon i {
+            font-size: 32px;
+            color: white;
+        }
+        
+        .sidebar .logo-text {
+            color: white;
+            font-size: 20px;
+            font-weight: 700;
+        }
+        
+        .sidebar nav {
+            padding: 24px 16px;
+        }
+        
+        .sidebar .nav-link {
+            color: rgba(255,255,255,0.85);
+            padding: 14px 16px;
+            margin: 4px 0;
+            border-radius: 12px;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+        }
+        
+        .sidebar .nav-link:hover {
+            background: rgba(255,255,255,0.12);
+            color: white;
+            transform: translateX(4px);
+        }
+        
+        .sidebar .nav-link.active {
+            background: linear-gradient(135deg, rgba(255,255,255,0.2), rgba(255,255,255,0.1));
+            color: white;
+        }
+        
+        .sidebar .nav-link i {
+            width: 24px;
+            margin-right: 14px;
+            font-size: 18px;
+        }
+        
+        .main-content {
+            margin-left: 280px;
+            padding: 0;
+            min-height: 100vh;
+        }
+        
+        .top-navbar {
+            background: white;
+            padding: 24px 40px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            margin-bottom: 32px;
+        }
+        
+        .top-navbar h2 {
+            color: var(--primary-color);
+            font-weight: 700;
+            margin: 0;
+        }
+        
+        .content-wrapper {
+            padding: 0 40px 40px;
+        }
+        
+        .filter-card {
+            background: white;
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            margin-bottom: 24px;
+        }
+        
+        .card {
+            border: none;
+            border-radius: 20px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.06);
+            margin-bottom: 24px;
+            overflow: hidden;
+        }
+        
+        .card-header {
+            background: linear-gradient(135deg, var(--primary-color), var(--primary-light));
+            color: white;
+            font-weight: 600;
+            padding: 20px 28px;
+            border: none;
+        }
+        
+        .stats-badge {
+            background: rgba(255,255,255,0.2);
+            padding: 4px 12px;
+            border-radius: 12px;
+            margin-left: 12px;
+            font-size: 14px;
+        }
+        
+        .table {
+            margin: 0;
+        }
+        
+        .table thead th {
+            background: #f8fafc;
+            color: var(--primary-color);
+            font-weight: 600;
+            border: none;
+            padding: 16px;
+        }
+        
+        .table tbody td {
+            padding: 16px;
+            vertical-align: middle;
+            border-color: #f1f5f9;
+        }
+        
+        .table tbody tr:hover {
+            background: #f8fafc;
+        }
+        
+        .badge {
+            padding: 6px 14px;
+            font-weight: 600;
+            font-size: 12px;
+            border-radius: 20px;
+        }
+        
+        .user-avatar {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--primary-color), #2196F3);
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 700;
+            margin-right: 12px;
+        }
+        
+        .btn-action {
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            margin: 2px;
+        }
+        
+        .pagination {
+            margin-top: 24px;
+        }
+        
+        .pagination .page-link {
+            color: var(--primary-color);
+            border-radius: 8px;
+            margin: 0 4px;
+        }
+        
+        .pagination .page-link:hover {
+            background: var(--primary-color);
+            color: white;
+        }
+        
+        .pagination .active .page-link {
+            background: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+        
+        .alert {
+            border: none;
+            border-radius: 12px;
+            padding: 16px 20px;
+        }
+        
+        .search-box {
+            position: relative;
+        }
+        
+        .search-box i {
+            position: absolute;
+            left: 16px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #94a3b8;
+        }
+        
+        .search-box input {
+            padding-left: 44px;
+            border-radius: 12px;
+            border: 2px solid #e2e8f0;
+        }
+        
+        .search-box input:focus {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(12, 60, 96, 0.1);
+        }
+    </style>
+</head>
+<body>
+    <!-- Sidebar -->
+    <div class="sidebar" id="sidebar">
+        <div class="logo-section">
+            <div class="logo-icon">
+                <i class="fas fa-user-shield"></i>
+            </div>
+            <div class="logo-text">Admin Panel</div>
+        </div>
+        
+        <nav>
+            <a class="nav-link" href="admin_dashboard.php">
+                <i class="fas fa-home"></i>
+                <span>Dashboard</span>
+            </a>
+            <a class="nav-link" href="add_penyelia.php">
+                <i class="fas fa-user-plus"></i>
+                <span>Tambah Penyelia</span>
+            </a>
+            <a class="nav-link active" href="manage_participants.php">
+                <i class="fas fa-users"></i>
+                <span>Urus Peserta</span>
+            </a>
+            <a class="nav-link" href="manage_penyelia.php">
+                <i class="fas fa-user-tie"></i>
+                <span>Urus Penyelia</span>
+            </a>
+            <a class="nav-link" href="manage_courses.php">
+                <i class="fas fa-book"></i>
+                <span>Urus Kursus</span>
+            </a>
+            <a class="nav-link" href="dashboard.php">
+                <i class="fas fa-eye"></i>
+                <span>Lihat Sebagai User</span>
+            </a>
+            <a class="nav-link" href="logout.php">
+                <i class="fas fa-sign-out-alt"></i>
+                <span>Log Keluar</span>
+            </a>
+        </nav>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <div class="top-navbar">
+            <h2><i class="fas fa-users me-3"></i>Pengurusan Peserta Kursus</h2>
+        </div>
+        
+        <div class="content-wrapper">
+            <?php if(isset($_SESSION['success'])): ?>
+                <div class="alert alert-success">
+                    <i class="fas fa-check-circle me-2"></i>
+                    <?= htmlspecialchars($_SESSION['success']) ?>
+                </div>
+                <?php unset($_SESSION['success']); ?>
+            <?php endif; ?>
+            
+            <!-- Search and Filter -->
+            <div class="filter-card">
+                <form method="GET" action="" class="row g-3 align-items-end">
+                    <div class="col-md-5">
+                        <label class="form-label fw-bold">Cari Peserta</label>
+                        <div class="search-box">
+                            <i class="fas fa-search"></i>
+                            <input type="text" name="search" class="form-control" 
+                                   placeholder="Nama, Email, atau No. KP" 
+                                   value="<?= htmlspecialchars($search) ?>">
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label fw-bold">Status</label>
+                        <select name="status" class="form-select" style="border-radius: 12px; border: 2px solid #e2e8f0;">
+                            <option value="all" <?= $status_filter === 'all' ? 'selected' : '' ?>>Semua</option>
+                            <option value="verified" <?= $status_filter === 'verified' ? 'selected' : '' ?>>Aktif</option>
+                            <option value="unverified" <?= $status_filter === 'unverified' ? 'selected' : '' ?>>Tidak Aktif</option>
+                        </select>
+                    </div>
+                    <div class="col-md-4">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-filter me-2"></i>Tapis
+                        </button>
+                        <a href="manage_participants.php" class="btn btn-outline-secondary">
+                            <i class="fas fa-redo me-2"></i>Reset
+                        </a>
+                    </div>
+                </form>
+            </div>
+
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>
+                        <i class="fas fa-list me-2"></i>Senarai Peserta
+                        <span class="stats-badge"><?= $total_users ?> peserta</span>
+                    </span>
+                    <a href="export_participants.php" class="btn btn-light btn-sm">
+                        <i class="fas fa-download me-2"></i>Export Excel
+                    </a>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Peserta</th>
+                                    <th>No. KP</th>
+                                    <th>Telefon</th>
+                                    <th>Jantina</th>
+                                    <th>Kursus</th>
+                                    <th>Status</th>
+                                    <th>Tindakan</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php if (empty($users)): ?>
+                                    <tr>
+                                        <td colspan="7" class="text-center py-5 text-muted">
+                                            <i class="fas fa-users fa-3x mb-3 d-block"></i>
+                                            Tiada peserta dijumpai
+                                        </td>
+                                    </tr>
+                                <?php else: ?>
+                                    <?php foreach($users as $user): ?>
+                                    <tr>
+                                        <td>
+                                            <div class="d-flex align-items-center">
+                                                <div class="user-avatar">
+                                                    <?= strtoupper(substr($user['nama'] ?? $user['email'], 0, 1)) ?>
+                                                </div>
+                                                <div>
+                                                    <div class="fw-bold">
+                                                        <?= htmlspecialchars($user['nama'] ?? 'Tiada Nama') ?>
+                                                    </div>
+                                                    <small class="text-muted">
+                                                        <?= htmlspecialchars($user['email']) ?>
+                                                    </small>
+                                                </div>
+                                            </div>
+                                        </td>
+                                        <td><?= htmlspecialchars($user['no_kp']) ?></td>
+                                        <td>
+                                            <?php if ($user['tel_rumah']): ?>
+                                                <?= htmlspecialchars($user['tel_rumah']) ?>
+                                            <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <?php if ($user['jantina'] === 'L'): ?>
+                                                <i class="fas fa-mars text-primary"></i> Lelaki
+                                            <?php elseif ($user['jantina'] === 'P'): ?>
+                                                <i class="fas fa-venus text-danger"></i> Perempuan
+                                            <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <span class="badge bg-info">
+                                                <?= $user['total_courses'] ?> kursus
+                                            </span>
+                                        </td>
+                                        <td>
+                                            <?php if ($user['is_verified']): ?>
+                                                <span class="badge bg-success">
+                                                    <i class="fas fa-check"></i> Aktif
+                                                </span>
+                                            <?php else: ?>
+                                                <span class="badge bg-warning text-dark">
+                                                    <i class="fas fa-times"></i> Tidak Aktif
+                                                </span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <a href="view_participant.php?id=<?= $user['id'] ?>" 
+                                               class="btn btn-sm btn-info btn-action" 
+                                               title="Lihat Profil">
+                                                <i class="fas fa-eye"></i>
+                                            </a>
+                                            
+                                            <form method="post" class="d-inline">
+                                                <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
+                                                <input type="hidden" name="current_status" value="<?= $user['is_verified'] ?>">
+                                                <button type="submit" name="toggle_status" 
+                                                        class="btn btn-sm <?= $user['is_verified'] ? 'btn-warning' : 'btn-success' ?> btn-action"
+                                                        title="<?= $user['is_verified'] ? 'Nyahaktif' : 'Aktifkan' ?>">
+                                                    <i class="fas fa-power-off"></i>
+                                                </button>
+                                            </form>
+                                            
+                                            <form method="post" class="d-inline" 
+                                                  onsubmit="return confirm('Adakah anda pasti ingin memadamkan peserta ini?');">
+                                                <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
+                                                <button type="submit" name="delete_user" 
+                                                        class="btn btn-sm btn-danger btn-action"
+                                                        title="Padam">
+                                                    <i class="fas fa-trash"></i>
+                                                </button>
+                                            </form>
+                                        </td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Pagination -->
+            <?php if ($total_pages > 1): ?>
+            <nav>
+                <ul class="pagination justify-content-center">
+                    <?php if ($page > 1): ?>
+                    <li class="page-item">
+                        <a class="page-link" href="?page=<?= $page - 1 ?>&search=<?= urlencode($search) ?>&status=<?= $status_filter ?>">
+                            <i class="fas fa-chevron-left"></i>
+                        </a>
+                    </li>
+                    <?php endif; ?>
+                    
+                    <?php for ($i = max(1, $page - 2); $i <= min($total_pages, $page + 2); $i++): ?>
+                    <li class="page-item <?= $i === $page ? 'active' : '' ?>">
+                        <a class="page-link" href="?page=<?= $i ?>&search=<?= urlencode($search) ?>&status=<?= $status_filter ?>">
+                            <?= $i ?>
+                        </a>
+                    </li>
+                    <?php endfor; ?>
+                    
+                    <?php if ($page < $total_pages): ?>
+                    <li class="page-item">
+                        <a class="page-link" href="?page=<?= $page + 1 ?>&search=<?= urlencode($search) ?>&status=<?= $status_filter ?>">
+                            <i class="fas fa-chevron-right"></i>
+                        </a>
+                    </li>
+                    <?php endif; ?>
+                </ul>
+            </nav>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
